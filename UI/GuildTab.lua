@@ -10,7 +10,6 @@ local KEY_YOU = "GuildSync:you"
 local KEY_BLOCKED = "GuildSync:blocked:" -- followed by the sync id
 local variables = {
     separator = " · ",
-    listSeparator = ", ",
 }
 
 local pendingNotice -- { key = string, text = string } shown once the detail of that key gets rebuilt
@@ -106,7 +105,7 @@ provider.GetItems = function(search)
             key = KEY_YOU,
             title = private.getLocalisation("You"),
             subtitle = GetSharingText(),
-            value = db.share and db.configured and private.getLocalisation("CharacterCount"):format(#ownChars) or nil,
+            value = db.share and db.configured and private.FormatCharacterCount(#ownChars) or nil,
         })
     end
 
@@ -140,7 +139,7 @@ provider.GetItems = function(search)
                 table.insert(accountItems, {
                     key = account.key,
                     title = account.display or account.key,
-                    subtitle = private.getLocalisation("CharacterCount"):format(count),
+                    subtitle = private.FormatCharacterCount(count),
                     value = customName or private.getLocalisation("NotSet"),
                     valueColor = not customName and Theme.colors.disabled or nil,
                 })
@@ -223,13 +222,19 @@ local function ShowYou(ui)
 end
 
 ---@param ui table
----@param chars table -- sorted list
----@param textKey string -- localisation key with one %s
+---@param groups table -- groups of the character grid that are filled
+---@param chars table -- sorted list of Name-Realm
+---@param titleKey string -- localisation key of the heading
 ---@param color table
-local function AddCharList(ui, chars, textKey, color)
+local function AddDiffGroup(ui, groups, chars, titleKey, color)
     if #chars == 0 then return end
-    local text = private.getLocalisation(textKey):format(table.concat(chars, variables.listSeparator))
-    ui.Add(ui.CreateLabel(text, "small", color), ui.margins.noticeMargin)
+    local items = {}
+    for index, charname in ipairs(chars) do
+        -- the cells are too narrow for long realm names, the tooltip shows the whole name
+        local name = ui.SplitCharName(charname)
+        items[index] = { text = name, classFile = ui.GetClass(charname), tooltip = charname }
+    end
+    table.insert(groups, { title = ui.Theme.Colorize(private.getLocalisation(titleKey), color), items = items })
 end
 
 ---@param ui table
@@ -297,14 +302,8 @@ local function ShowAccount(ui, key, syncId, isPending)
     ui.Add(bottomLine, 0, "BOTTOM")
 
     if isPending then
+        -- the decision stays at the bottom, the changes scroll in between however many characters there are
         local diff = Sync.GetDiff(syncId)
-        ui.Add(ui.CreateCaption(private.getLocalisation("PendingTitle")), margins.sectionMargin)
-        if diff.oldKey and diff.moved > 0 then
-            ui.Add(ui.CreateLabel(private.getLocalisation("PendingMoved"):format(diff.moved), "small", Theme.colors.text), margins.noticeMargin)
-        end
-        AddCharList(ui, diff.added, "PendingAdded", Theme.colors.success)
-        AddCharList(ui, diff.removed, "PendingRemoved", Theme.colors.danger)
-        AddCharList(ui, diff.conflicts, "PendingConflicts", Theme.colors.muted)
         local line = ui.CreateLine()
         line:AddChild(ui.CreateButton(private.getLocalisation("Accept"), "primary", function()
             Sync.Accept(syncId)
@@ -318,10 +317,18 @@ local function ShowAccount(ui, key, syncId, isPending)
             Sync.Decline(syncId)
             ui.Refresh(true)
         end))
-        ui.Add(line, margins.groupMargin)
-    end
+        ui.Add(line, margins.groupMargin, "BOTTOM")
 
-    if account then
+        ui.Add(ui.CreateCaption(private.getLocalisation("PendingTitle")), margins.sectionMargin)
+        if diff.oldKey and diff.moved > 0 then
+            ui.Add(ui.CreateLabel(private.getLocalisation("PendingMoved"):format(diff.moved), "small", Theme.colors.text), margins.noticeMargin)
+        end
+        local groups = {}
+        AddDiffGroup(ui, groups, diff.added, "PendingGroupAdded", Theme.colors.success)
+        AddDiffGroup(ui, groups, diff.removed, "PendingGroupRemoved", Theme.colors.danger)
+        AddDiffGroup(ui, groups, diff.conflicts, "PendingGroupConflicts", Theme.colors.muted)
+        ui.AddGrid(groups)
+    elseif account then
         ui.Add(ui.CreateToggle(private.getLocalisation("TrustToggle"), account.trusted, function(value)
             Sync.SetTrusted(syncId, value)
             ui.Refresh(true)
@@ -331,7 +338,11 @@ local function ShowAccount(ui, key, syncId, isPending)
         if #chars == 0 then
             ui.Add(ui.CreateLabel(private.getLocalisation("NoLinkedCharacters"), "small", Theme.colors.muted), margins.noticeMargin)
         else
-            ui.AddCharacterGrid(chars)
+            ui.AddCharacterGrid(chars, nil, function(charname)
+                Sync.RemoveChar(syncId, charname)
+                pendingNotice = { key = key, text = private.getLocalisation("CharacterRemoved"):format(charname) }
+                ui.Refresh(true)
+            end)
         end
     end
     ui.Finish()

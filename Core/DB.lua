@@ -63,16 +63,36 @@ end
 private.GetOwnBattleTag = function()
     if not BNGetInfo then return nil end
     local _, battleTag = BNGetInfo()
-    if type(battleTag) == "string" and private.IsReadable(battleTag) and battleTag:match("^[^#%s]+#%d+$") then
+    if private.IsReadable(battleTag) and type(battleTag) == "string" and battleTag:match("^[^#%s]+#%d+$") then
         return battleTag
     end
     return nil
 end
 
----@return string fullName -- Name-Realm of the logged in character
-private.GetPlayerName = function()
+local playerName, playerFullName -- remembered while they can be read, unit names can turn secret during lockdowns
+
+---@return string? name -- name of the logged in character without the realm
+---@return string? fullName -- Name-Realm of the logged in character
+local function ReadPlayerName()
+    if playerFullName then return playerName, playerFullName end
     local name, realm = UnitFullName("player")
-    return name .. "-" .. ((realm and realm ~= "") and realm or NormalizedRealmName())
+    if not (private.IsReadable(name) and private.IsReadable(realm)) or type(name) ~= "string" then return nil end
+    if type(realm) ~= "string" or realm == "" then
+        realm = NormalizedRealmName()
+    end
+    playerName, playerFullName = name, name .. "-" .. realm
+    return playerName, playerFullName
+end
+
+---@return string? fullName -- Name-Realm of the logged in character, nil while it can't be read
+private.GetPlayerName = function()
+    local _, fullName = ReadPlayerName()
+    return fullName
+end
+
+---@return string? name -- the logged in character without the realm, nil while it can't be read
+private.GetPlayerShortName = function()
+    return (ReadPlayerName())
 end
 
 ---@param syncId string
@@ -101,7 +121,10 @@ private.GetOwnChars = function()
         set[charname] = true
     end
     -- CustomNames links the character on login, but only if it isn't linked elsewhere
-    set[private.GetPlayerName()] = true
+    local playerFullName = private.GetPlayerName()
+    if playerFullName then
+        set[playerFullName] = true
+    end
     local list = {}
     for charname in pairs(set) do
         table.insert(list, charname)
@@ -153,6 +176,7 @@ frame:SetScript("OnEvent", function(self, event, addon)
     end
     db.syncId = db.syncId or GenerateSyncId()
     private.db = db
+    ReadPlayerName()
     for _, func in ipairs(readyCallbacks) do
         func()
     end

@@ -69,11 +69,40 @@ local function InLockdown()
     return C_ChatInfo.InChatMessagingLockdown ~= nil and C_ChatInfo.InChatMessagingLockdown()
 end
 
-local function FlushQueue()
+local LOCKDOWN_RESULT = Enum.SendAddonMessageResult and Enum.SendAddonMessageResult.AddOnMessageLockdown
+local FlushQueue
+
+---Keeps a message until the lockdown is over, only the newest message of a kind to a target is kept
+---@param queueKey string
+---@param entry table -- { text, distribution, target }
+local function Hold(queueKey, entry)
+    queue[queueKey] = { text = entry.text, distribution = entry.distribution, target = entry.target }
+    if not retryTicker then
+        retryTicker = C_Timer.NewTicker(variables.retryInterval, FlushQueue)
+    end
+end
+
+---@param queueKey string
+---@param entry table -- { text, distribution, target }
+local function Transmit(queueKey, entry)
+    local held = false
+    -- ChatThrottleLib sends later than it is asked to. A lockdown that starts in between makes the game refuse
+    -- the message and ChatThrottleLib drops it, so it is held and sent again as a whole once the lockdown is over
+    -- depending on the versions of AceComm and ChatThrottleLib the last argument is the result code or only "did send"
+    Comm:SendCommMessage(PREFIX, entry.text, entry.distribution, entry.target, "BULK", function(_, _, _, sendResult)
+        local refused = (LOCKDOWN_RESULT and sendResult == LOCKDOWN_RESULT) or (sendResult == false and InLockdown())
+        if not held and refused then
+            held = true
+            Hold(queueKey, entry)
+        end
+    end)
+end
+
+FlushQueue = function()
     if InLockdown() then return end
     for queueKey, entry in pairs(queue) do
         queue[queueKey] = nil
-        Comm:SendCommMessage(PREFIX, entry.text, entry.distribution, entry.target, "BULK")
+        Transmit(queueKey, entry)
     end
     if retryTicker and not next(queue) then
         retryTicker:Cancel()
@@ -88,16 +117,13 @@ end
 local function Send(message, distribution, target)
     if not IsActive() then return false end
     message.v = PROTOCOL
-    local text = Encode(message)
+    local entry = { text = Encode(message), distribution = distribution, target = target }
+    local queueKey = distribution .. (target or "") .. message.t
     if InLockdown() then
-        -- only the newest message of a kind to a target is kept
-        queue[distribution .. (target or "") .. message.t] = { text = text, distribution = distribution, target = target }
-        if not retryTicker then
-            retryTicker = C_Timer.NewTicker(variables.retryInterval, FlushQueue)
-        end
+        Hold(queueKey, entry)
         return false
     end
-    Comm:SendCommMessage(PREFIX, text, distribution, target, "BULK")
+    Transmit(queueKey, entry)
     return true
 end
 
@@ -131,7 +157,8 @@ end
 
 ---@param sender string
 local function SendData(sender)
-    if not private.db.share then return end
+    local display = private.GetPlayerShortName()
+    if not private.db.share or not display then return end
     local key, battleTag = private.GetOwnKey()
     local chars = private.GetOwnChars()
     Send({
@@ -139,7 +166,7 @@ local function SendData(sender)
         id = private.db.syncId,
         key = key,
         btag = battleTag,
-        display = (UnitName("player")),
+        display = display,
         chars = chars,
         hash = private.HashPayload(key, chars),
     }, "WHISPER", sender)
@@ -159,26 +186,32 @@ end
 ---@param sender string -- Name-Realm
 ---@return boolean own -- the message came from this account
 local function IsOwnCharacter(sender)
-    if sender == private.GetPlayerName() then return true end
+    local playerName = private.GetPlayerName()
+    -- without the own name a message of the own account can't be told apart, so it is dropped
+    if not playerName or sender == playerName then return true end
     return lib.GetLinkedCharacters(private.SELF_BTAG)[sender] ~= nil
 end
 
 ---@param keep boolean? -- add to what is known instead of starting over (senders seen in guild chat stay)
 local function UpdateRoster(keep)
+    -- the roster functions have no documentation about secrets, so nothing they return is used before it was checked
+    local count = GetNumGuildMembers()
+    if not private.IsReadable(count) or type(count) ~= "number" then return end
     if not keep then
         wipe(roster)
     end
-    for index = 1, GetNumGuildMembers() do
+    for index = 1, count do
         local name = GetGuildRosterInfo(index)
-        if name and private.IsReadable(name) then
+        if private.IsReadable(name) and type(name) == "string" then
             roster[private.FullName(name)] = true
         end
     end
 end
 
 function Comm:OnCommReceived(prefix, text, distribution, sender)
+    -- secret values raise an error on comparisons, so every argument is checked before anything else
+    if not (private.IsReadable(prefix) and private.IsReadable(text) and private.IsReadable(distribution) and private.IsReadable(sender)) then return end
     if prefix ~= PREFIX or not IsActive() then return end
-    if not (private.IsReadable(text) and private.IsReadable(sender)) then return end
     if type(text) ~= "string" or #text > variables.maxMessageLength or type(sender) ~= "string" then return end
     if distribution ~= "GUILD" and distribution ~= "WHISPER" then return end
     sender = private.FullName(sender)

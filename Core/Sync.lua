@@ -93,13 +93,16 @@ Sync.GetDiff = function(syncId)
     if not payload then return nil end
     local account = db.accounts[syncId]
     local accepted = account and account.accepted or {}
+    local excluded = account and account.excluded or {}
     local oldKey = account and account.key ~= payload.key and account.key or nil
     local linked = lib.GetLinkedCharacters(payload.key)
     local incoming = {}
     local diff = { added = {}, removed = {}, conflicts = {}, moved = 0, oldKey = oldKey }
     for _, charname in ipairs(payload.chars) do
         incoming[charname] = true
-        if not accepted[charname] then
+        if excluded[charname] then
+            -- the user removed this character from the account, it is not offered again
+        elseif not accepted[charname] then
             if linked[charname] or not lib.IsInBnetDatabase(charname) then
                 table.insert(diff.added, charname)
             else
@@ -125,6 +128,19 @@ end
 
 local function Changed()
     lib.RefreshWindow()
+end
+
+local applying = false -- set while this addon writes to CustomNames itself, see Char_Unlinked below
+
+---Runs writes of this addon to CustomNames, removals in there are not mistaken for removals by the user
+---@param func function
+local function Apply(func)
+    applying = true
+    local success, message = pcall(func)
+    applying = false
+    if not success then
+        geterrorhandler()(message)
+    end
 end
 
 ---Moves the accepted characters and the custom name of an account to the key it is shared under now
@@ -163,16 +179,30 @@ Sync.Accept = function(syncId, trust)
         account = { key = payload.key, accepted = {}, trusted = false }
         db.accounts[syncId] = account
     end
-    if diff.oldKey then
-        MoveAccount(account, payload.key)
-    end
-    for _, charname in ipairs(diff.removed) do
-        lib.RemoveCharFromBtag(charname, account.key)
-        account.accepted[charname] = nil
-    end
-    for _, charname in ipairs(diff.added) do
-        lib.AddCharToBtag(charname, account.key)
-        account.accepted[charname] = true
+    Apply(function()
+        if diff.oldKey then
+            MoveAccount(account, payload.key)
+        end
+        for _, charname in ipairs(diff.removed) do
+            lib.RemoveCharFromBtag(charname, account.key)
+            account.accepted[charname] = nil
+        end
+        for _, charname in ipairs(diff.added) do
+            lib.AddCharToBtag(charname, account.key)
+            account.accepted[charname] = true
+        end
+    end)
+    -- characters the guildmate doesn't share anymore don't have to be remembered as removed
+    if account.excluded then
+        local offered = {}
+        for _, charname in ipairs(payload.chars) do
+            offered[charname] = true
+        end
+        for charname in pairs(account.excluded) do
+            if not offered[charname] then
+                account.excluded[charname] = nil
+            end
+        end
     end
     account.display = payload.display
     account.btag = payload.btag
@@ -238,12 +268,14 @@ Sync.Forget = function(syncId)
     local db = private.db
     local account = db.accounts[syncId]
     if account then
-        for charname in pairs(account.accepted) do
-            lib.RemoveCharFromBtag(charname, account.key)
-        end
-        if account.key:sub(1, #private.ANON_PREFIX) == private.ANON_PREFIX and lib.Get(account.key) ~= account.key then
-            lib.Set(account.key)
-        end
+        Apply(function()
+            for charname in pairs(account.accepted) do
+                lib.RemoveCharFromBtag(charname, account.key)
+            end
+            if account.key:sub(1, #private.ANON_PREFIX) == private.ANON_PREFIX and lib.Get(account.key) ~= account.key then
+                lib.Set(account.key)
+            end
+        end)
     end
     db.accounts[syncId] = nil
     db.pending[syncId] = nil
@@ -297,3 +329,25 @@ Sync.FindByKey = function(key)
     end
     return nil
 end
+
+---Removes one accepted character from a guildmate, later shares don't offer it again
+---@param syncId string
+---@param charname string
+Sync.RemoveChar = function(syncId, charname)
+    local account = private.db.accounts[syncId]
+    if not account or not account.accepted[charname] then return end
+    -- Char_Unlinked below records the removal, it also catches removals on the BattleTags tab
+    lib.RemoveCharFromBtag(charname, account.key, true)
+end
+
+-- a character of a synced account was removed in CustomNames (by the user, here or on the BattleTags tab)
+local callbackOwner = {}
+lib.RegisterCallback(callbackOwner, "Char_Unlinked", function(_, charname, btag)
+    if applying or not private.db then return end
+    local _, account = Sync.FindByKey(btag)
+    if not account or not account.accepted[charname] then return end
+    account.accepted[charname] = nil
+    account.excluded = account.excluded or {}
+    account.excluded[charname] = true
+    Changed()
+end)
