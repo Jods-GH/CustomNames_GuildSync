@@ -1,0 +1,23 @@
+name: Upload localization strings to CurseForge
+
+on:
+  push:
+    paths:
+      - 'Locales/**'
+  workflow_dispatch:
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone project
+        uses: actions/checkout@v4
+
+      - name: Upload localizations
+        uses: p3lim/curseforge-localizations@v2
+        with:
+          handle_missing: DeletePhrase
+          exclude:
+            Libs/*
+        env:
+          CF_API_KEY: ${{ secrets.CF_API_KEY }}
