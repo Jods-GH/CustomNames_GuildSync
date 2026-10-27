@@ -1,0 +1,37 @@
+## Interface: 120105, 120107, 16001, 50504, 38002, 20506, 11509
+## Title: CustomNames_GuildSync
+## Version: @project-version@
+## Notes: Shares your characters with your guild and links the characters of your guildmates to their accounts in CustomNames
+## Author: Jods
+## SavedVariables: CustomNamesGuildSyncDB
+## X-Curse-Project-ID: 1769379
+## X-Wago-ID: n6VY0nNd
+## RequiredDeps: CustomNames
+## OptionalDeps: Ace3
+## Category-enUS: User Interface
+## Category-deDE: Benutzerinterface
+## Category-esES: Interfaz de usuario
+## Category-esMX: Interfaz de usuario
+## Category-frFR: Interface utilisateur
+## Category-itIT: Interfaccia utente
+## Category-koKR: 사용자 인터페이스
+## Category-ptBR: Interface do usuário
+## Category-ruRU: Интерфейс пользователя
+## Category-zhCN: 用户界面
+## Category-zhTW: 使用者介面
+
+#Libs
+embeds.xml
+
+# Locales
+Locales\enUS.lua
+Locales\Locales.lua
+
+# Core
+Core\DB.lua
+Core\Comm.lua
+Core\Sync.lua
+
+# UI
+UI\FirstRunPopup.lua
+UI\GuildTab.lua

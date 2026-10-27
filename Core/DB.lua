@@ -1,0 +1,160 @@
+local appName, app = ...
+---@class CustomNamesGuildSyncPrivate
+local private = app
+local lib = LibStub("CustomNames")
+
+-- accounts of guildmates that don't share their btag are stored under this prefix and their sync id,
+-- it looks like a btag so CustomNames handles it like one
+private.ANON_PREFIX = "GuildSync#"
+private.SELF_BTAG = "self"
+
+local defaults = {
+    configured = false, -- the first run popup was answered, nothing is sent or received before that
+    share = true,
+    shareBattleTag = false,
+    syncId = nil, -- generated once per account
+    accounts = {}, -- [syncId] = { key, display, btag?, sender, accepted = { [Name-Realm] = true }, trusted, lastHash, lastSeen }
+    pending = {}, -- [syncId] = payload of DATA that waits for the user, see Sync.lua
+    declined = {}, -- [syncId] = hash of the payload that was declined
+    blocked = {}, -- [syncId] = { display, sender }
+}
+
+local readyCallbacks = {}
+
+---@return string syncId -- 10 digits
+local function GenerateSyncId()
+    return string.format("%05d%05d", math.random(0, 99999), math.random(0, 99999))
+end
+
+---Runs the function once the saved variables are loaded
+---@param func function
+private.OnReady = function(func)
+    if private.db then
+        func()
+    else
+        table.insert(readyCallbacks, func)
+    end
+end
+
+--- Since GetNormalizedRealmName can return nil we need to gsub GetRealmName ourselfs if need be
+---@return string Realm
+local function NormalizedRealmName()
+    return GetNormalizedRealmName() or GetRealmName():gsub("[%s-]+", "")
+end
+private.NormalizedRealmName = NormalizedRealmName
+
+---@param value any
+---@return boolean readable -- false for secret values, they can't be compared or used as a key
+private.IsReadable = function(value)
+    if issecretvalue and issecretvalue(value) then return false end
+    if canaccessvalue and not canaccessvalue(value) then return false end
+    return true
+end
+
+---Adds the realm to a name that has none (addon messages from the own realm can come without it)
+---@param name string
+---@return string fullName -- Name-Realm
+private.FullName = function(name)
+    if name:find("-", 1, true) then return name end
+    return name .. "-" .. NormalizedRealmName()
+end
+
+---@return string? battleTag -- nil if battle.net is not available
+private.GetOwnBattleTag = function()
+    if not BNGetInfo then return nil end
+    local _, battleTag = BNGetInfo()
+    if type(battleTag) == "string" and private.IsReadable(battleTag) and battleTag:match("^[^#%s]+#%d+$") then
+        return battleTag
+    end
+    return nil
+end
+
+---@return string fullName -- Name-Realm of the logged in character
+private.GetPlayerName = function()
+    local name, realm = UnitFullName("player")
+    return name .. "-" .. ((realm and realm ~= "") and realm or NormalizedRealmName())
+end
+
+---@param syncId string
+---@return string key -- the anonymous key an account is stored under in CustomNames
+private.GetAnonKey = function(syncId)
+    return private.ANON_PREFIX .. syncId
+end
+
+---@return string key -- what guildmates store the own characters under
+---@return string? battleTag -- set if the btag is shared
+private.GetOwnKey = function()
+    local db = private.db
+    if db.shareBattleTag then
+        local battleTag = private.GetOwnBattleTag()
+        if battleTag then
+            return battleTag, battleTag
+        end
+    end
+    return private.GetAnonKey(db.syncId), nil
+end
+
+---@return table chars -- sorted list of the characters of this account (Name-Realm)
+private.GetOwnChars = function()
+    local set = {}
+    for charname in pairs(lib.GetLinkedCharacters(private.SELF_BTAG)) do
+        set[charname] = true
+    end
+    -- CustomNames links the character on login, but only if it isn't linked elsewhere
+    set[private.GetPlayerName()] = true
+    local list = {}
+    for charname in pairs(set) do
+        table.insert(list, charname)
+    end
+    table.sort(list)
+    return list
+end
+
+---@param set table -- [Name-Realm] = true
+---@return table list -- sorted names
+private.SortedKeys = function(set)
+    local list = {}
+    for key in pairs(set) do
+        table.insert(list, key)
+    end
+    table.sort(list)
+    return list
+end
+
+---Hash of what an account shares, used to notice changes without sending the whole list
+---@param key string
+---@param chars table -- sorted list
+---@return string hash
+private.HashPayload = function(key, chars)
+    local text = key .. "|" .. table.concat(chars, ",")
+    local hash = 5381
+    for index = 1, #text do
+        hash = (hash * 33 + text:byte(index)) % 4294967296
+    end
+    return string.format("%08x", hash)
+end
+
+---@param message string
+private.Print = function(message)
+    print(private.getLocalisation("ChatPrefix") .. message)
+end
+
+local frame = CreateFrame("Frame")
+frame:RegisterEvent("ADDON_LOADED")
+frame:SetScript("OnEvent", function(self, event, addon)
+    if addon ~= appName then return end
+    self:UnregisterEvent("ADDON_LOADED")
+    CustomNamesGuildSyncDB = CustomNamesGuildSyncDB or {}
+    local db = CustomNamesGuildSyncDB
+    for key, value in pairs(defaults) do
+        if db[key] == nil then
+            db[key] = type(value) == "table" and CopyTable(value) or value
+        end
+    end
+    db.syncId = db.syncId or GenerateSyncId()
+    private.db = db
+    for _, func in ipairs(readyCallbacks) do
+        func()
+    end
+    wipe(readyCallbacks)
+end)
