@@ -9,7 +9,9 @@ CustomNames links the characters of your Battle.net friends to their account aut
 
 - Your own characters are shared with guildmates that also run CustomNames_GuildSync, either under your BattleTag or under an anonymous account id (your choice, asked on first login).
 - Characters shared by guildmates are only saved after you accept them in the **Guild** tab of `/cn`. Later changes (new or removed characters) are asked again, unless you trust that guildmate.
-- Only which characters belong to an account is shared. Custom names are never sent, they stay yours.
+- Only which characters belong to an account is shared. The custom names you give others are never sent, they stay yours.
+- Optionally the name you gave yourself in CustomNames is shared too. Guildmates are offered it as the name of your account, a name they set themselves is never replaced.
+- Nicknames of guildmates that use Northern Sky Raid Tools are offered in the **Guild** tab as well, and with your name shared, they see it as your nickname (Northern Sky Raid Tools doesn't have to be installed).
 
 You can switch to receive only at any time in the Guild tab.
 

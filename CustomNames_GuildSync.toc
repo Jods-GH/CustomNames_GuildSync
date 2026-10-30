@@ -31,6 +31,7 @@ Locales\Locales.lua
 Core\DB.lua
 Core\Comm.lua
 Core\Sync.lua
+Core\NSRT.lua
 
 # UI
 UI\FirstRunPopup.lua

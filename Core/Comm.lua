@@ -6,9 +6,10 @@ local AceComm = LibStub("AceComm-3.0")
 
 -- Messages are tables, serialized to CBOR, compressed and base64 encoded (addon messages can't carry "\0").
 -- v is the protocol version:
--- HELLO  { t = "H", v, id, hash, q? } -- "this is what I share", to the guild or as an answer to q (query) by whisper
+-- HELLO  { t = "H", v, id, hash, h2?, q? } -- "this is what I share", to the guild or as an answer to q (query) by whisper
 -- REQ    { t = "R", v }                -- "send me your characters", by whisper
--- DATA   { t = "D", v, id, key, btag?, display, chars, hash } -- by whisper, only if sharing is enabled
+-- DATA   { t = "D", v, id, key, btag?, display, name?, chars, hash } -- by whisper, only if sharing is enabled
+-- hash leaves the name out so versions that don't know it don't ask again and again, h2 includes it
 local PREFIX = "CNGuildSync"
 local PROTOCOL = 1
 local variables = {
@@ -27,8 +28,9 @@ private.Comm = Comm
 local roster = {} -- [Name-Realm] = true for every member of the own guild
 local lastRequest = {} -- [sender] = GetTime() of the last REQ
 local lastAnswer = {} -- [sender] = GetTime() of the last answer to a query
-local queue = {} -- [distribution .. target .. type] = { text, distribution, target }
+local queue = {} -- [prefix .. distribution .. target .. type] = { prefix, text, distribution, target }
 local retryTicker
+local lastSharedName -- the own name the last HELLO was built with
 
 -- every client in the toc has it except possibly some classic ones, those can't take part in the sync
 if not (C_EncodingUtil and C_EncodingUtil.SerializeCBOR) then
@@ -63,6 +65,7 @@ end
 local function IsActive()
     return private.db and private.db.configured and not private.outdated and not private.unsupported and IsInGuild()
 end
+Comm.IsActive = IsActive
 
 ---@return boolean locked -- addon messages can't be sent right now (retail, in instances during encounters and similar)
 local function InLockdown()
@@ -74,22 +77,22 @@ local FlushQueue
 
 ---Keeps a message until the lockdown is over, only the newest message of a kind to a target is kept
 ---@param queueKey string
----@param entry table -- { text, distribution, target }
+---@param entry table -- { prefix, text, distribution, target }
 local function Hold(queueKey, entry)
-    queue[queueKey] = { text = entry.text, distribution = entry.distribution, target = entry.target }
+    queue[queueKey] = { prefix = entry.prefix, text = entry.text, distribution = entry.distribution, target = entry.target }
     if not retryTicker then
         retryTicker = C_Timer.NewTicker(variables.retryInterval, FlushQueue)
     end
 end
 
 ---@param queueKey string
----@param entry table -- { text, distribution, target }
+---@param entry table -- { prefix, text, distribution, target }
 local function Transmit(queueKey, entry)
     local held = false
     -- ChatThrottleLib sends later than it is asked to. A lockdown that starts in between makes the game refuse
     -- the message and ChatThrottleLib drops it, so it is held and sent again as a whole once the lockdown is over
     -- depending on the versions of AceComm and ChatThrottleLib the last argument is the result code or only "did send"
-    Comm:SendCommMessage(PREFIX, entry.text, entry.distribution, entry.target, "BULK", function(_, _, _, sendResult)
+    Comm:SendCommMessage(entry.prefix, entry.text, entry.distribution, entry.target, "BULK", function(_, _, _, sendResult)
         local refused = (LOCKDOWN_RESULT and sendResult == LOCKDOWN_RESULT) or (sendResult == false and InLockdown())
         if not held and refused then
             held = true
@@ -110,15 +113,17 @@ FlushQueue = function()
     end
 end
 
----@param message table
+---Sends already encoded text, also used for the messages of other addons (see NSRT.lua)
+---@param prefix string
+---@param kind string -- only the newest message of a kind to a target waits for the lockdown to end
+---@param text string
 ---@param distribution "GUILD"|"WHISPER"
 ---@param target string? -- Name-Realm for whispers
 ---@return boolean sent -- false if it waits for the lockdown to end
-local function Send(message, distribution, target)
+Comm.SendText = function(prefix, kind, text, distribution, target)
     if not IsActive() then return false end
-    message.v = PROTOCOL
-    local entry = { text = Encode(message), distribution = distribution, target = target }
-    local queueKey = distribution .. (target or "") .. message.t
+    local entry = { prefix = prefix, text = text, distribution = distribution, target = target }
+    local queueKey = prefix .. distribution .. (target or "") .. kind
     if InLockdown() then
         Hold(queueKey, entry)
         return false
@@ -127,10 +132,27 @@ local function Send(message, distribution, target)
     return true
 end
 
+---@param message table
+---@param distribution "GUILD"|"WHISPER"
+---@param target string? -- Name-Realm for whispers
+---@return boolean sent -- false if it waits for the lockdown to end
+local function Send(message, distribution, target)
+    if not IsActive() then return false end
+    message.v = PROTOCOL
+    return Comm.SendText(PREFIX, message.t, Encode(message), distribution, target)
+end
+
 ---@return table message -- the HELLO of this account
 local function BuildHello()
     local key = private.GetOwnKey()
-    return { t = "H", id = private.db.syncId, hash = private.HashPayload(key, private.GetOwnChars()) }
+    local chars = private.GetOwnChars()
+    local name = private.GetSharedName()
+    return {
+        t = "H",
+        id = private.db.syncId,
+        hash = private.HashPayload(key, chars),
+        h2 = name and private.HashPayload(key, chars, name) or nil,
+    }
 end
 
 ---Tells the guild what this account shares
@@ -144,6 +166,10 @@ Comm.BroadcastHello = function(query)
         message = { t = "H" } -- receive only accounts still ask the others
     end
     message.q = query or nil
+    lastSharedName = private.GetSharedName()
+    if private.NSRT then
+        private.NSRT.SendNickName()
+    end
     return Send(message, "GUILD")
 end
 
@@ -161,14 +187,16 @@ local function SendData(sender)
     if not private.db.share or not display then return end
     local key, battleTag = private.GetOwnKey()
     local chars = private.GetOwnChars()
+    local name = private.GetSharedName()
     Send({
         t = "D",
         id = private.db.syncId,
         key = key,
         btag = battleTag,
         display = display,
+        name = name,
         chars = chars,
-        hash = private.HashPayload(key, chars),
+        hash = private.HashPayload(key, chars, name),
     }, "WHISPER", sender)
 end
 
@@ -191,6 +219,7 @@ local function IsOwnCharacter(sender)
     if not playerName or sender == playerName then return true end
     return lib.GetLinkedCharacters(private.SELF_BTAG)[sender] ~= nil
 end
+Comm.IsOwnCharacter = IsOwnCharacter
 
 ---@param keep boolean? -- add to what is known instead of starting over (senders seen in guild chat stay)
 local function UpdateRoster(keep)
@@ -208,6 +237,22 @@ local function UpdateRoster(keep)
     end
 end
 
+---Checks the sender of an addon message before anything in it is used
+---@param sender string -- Name-Realm
+---@param distribution string
+---@return boolean member
+Comm.IsGuildMember = function(sender, distribution)
+    if distribution == "GUILD" then
+        -- the server only delivers guild messages from members, the roster may not be loaded yet
+        roster[sender] = true
+        return true
+    end
+    if not roster[sender] then
+        UpdateRoster(true)
+    end
+    return roster[sender] == true
+end
+
 function Comm:OnCommReceived(prefix, text, distribution, sender)
     -- secret values raise an error on comparisons, so every argument is checked before anything else
     if not (private.IsReadable(prefix) and private.IsReadable(text) and private.IsReadable(distribution) and private.IsReadable(sender)) then return end
@@ -215,14 +260,7 @@ function Comm:OnCommReceived(prefix, text, distribution, sender)
     if type(text) ~= "string" or #text > variables.maxMessageLength or type(sender) ~= "string" then return end
     if distribution ~= "GUILD" and distribution ~= "WHISPER" then return end
     sender = private.FullName(sender)
-    if IsOwnCharacter(sender) then return end
-    if distribution == "GUILD" then
-        -- the server only delivers guild messages from members, the roster may not be loaded yet
-        roster[sender] = true
-    elseif not roster[sender] then
-        UpdateRoster(true)
-        if not roster[sender] then return end
-    end
+    if IsOwnCharacter(sender) or not Comm.IsGuildMember(sender, distribution) then return end
 
     local message = Decode(text)
     if not message or message.v ~= PROTOCOL then return end
@@ -231,7 +269,8 @@ function Comm:OnCommReceived(prefix, text, distribution, sender)
         if message.q then
             AnswerQuery(sender)
         end
-        if type(message.id) == "string" and type(message.hash) == "string" and private.Sync.WantsData(message.id, message.hash) then
+        local hash = type(message.h2) == "string" and message.h2 or message.hash
+        if type(message.id) == "string" and type(hash) == "string" and private.Sync.WantsData(message.id, hash) then
             Request(sender)
         end
     elseif message.t == "R" and distribution == "WHISPER" then
@@ -254,6 +293,28 @@ Comm.Start = function()
         Comm.BroadcastHello(true)
     end)
 end
+
+local nameChangeQueued = false
+
+-- CustomNames fires the name events for every character of an account, a change of the own name only goes out once
+---@param name string -- Name-Realm or btag the event is about
+local function OnNameEvent(_, name)
+    if nameChangeQueued or not helloSent or not private.db or not private.db.shareName then return end
+    if not private.IsReadable(name) or type(name) ~= "string" then return end
+    if name ~= private.SELF_BTAG and not lib.GetLinkedCharacters(private.SELF_BTAG)[name] then return end
+    nameChangeQueued = true
+    C_Timer.After(1, function()
+        nameChangeQueued = false
+        if private.GetSharedName() == lastSharedName then return end
+        Comm.BroadcastHello()
+        lib.RefreshWindow()
+    end)
+end
+
+local callbackOwner = {}
+lib.RegisterCallback(callbackOwner, "Name_Added", OnNameEvent)
+lib.RegisterCallback(callbackOwner, "Name_Update", OnNameEvent)
+lib.RegisterCallback(callbackOwner, "Name_Removed", OnNameEvent)
 
 local frame = CreateFrame("Frame")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")

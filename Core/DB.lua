@@ -7,16 +7,19 @@ local lib = LibStub("CustomNames")
 -- it looks like a btag so CustomNames handles it like one
 private.ANON_PREFIX = "GuildSync#"
 private.SELF_BTAG = "self"
+private.MAX_NAME_CHARS = 48
 
 local defaults = {
     configured = false, -- the first run popup was answered, nothing is sent or received before that
     share = true,
     shareBattleTag = false,
+    shareName = false,
     syncId = nil, -- generated once per account
-    accounts = {}, -- [syncId] = { key, display, btag?, sender, accepted = { [Name-Realm] = true }, trusted, lastHash, lastSeen }
+    accounts = {}, -- [syncId] = { key, display, btag?, name?, sender, accepted = { [Name-Realm] = true }, trusted, lastHash, lastSeen }
     pending = {}, -- [syncId] = payload of DATA that waits for the user, see Sync.lua
     declined = {}, -- [syncId] = hash of the payload that was declined
-    blocked = {}, -- [syncId] = { display, sender }
+    blocked = {}, -- [syncId or "nsrt:" .. Name-Realm] = { display, sender }
+    nicknames = {}, -- [Name-Realm] = { nickname?, offer = string|false|nil, declined?, trusted, lastSeen }, see NSRT.lua
 }
 
 local readyCallbacks = {}
@@ -133,6 +136,47 @@ private.GetOwnChars = function()
     return list
 end
 
+---Cuts a text to a number of characters without splitting a multibyte character
+---@param text string
+---@param maxChars number
+---@return string text
+private.Utf8Sub = function(text, maxChars)
+    local count, cut = 0, 0
+    for char in text:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+        count = count + 1
+        if count > maxChars then break end
+        cut = cut + #char
+    end
+    return text:sub(1, cut)
+end
+
+---Makes a name that came from somewhere else safe to show and store
+---@param value any
+---@param maxChars number
+---@return string? name -- nil if nothing usable is left
+private.SanitizeName = function(value, maxChars)
+    if type(value) ~= "string" then return nil end
+    -- escape sequences would let a name color or hyperlink itself in chat
+    local name = value:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", ""):gsub("[|%c]", "")
+    name = private.Utf8Sub(strtrim(name), maxChars)
+    if name == "" then return nil end
+    return name
+end
+
+---@return string? name -- the custom name the user set for their own account in CustomNames
+private.GetOwnName = function()
+    local name = lib.Get(private.SELF_BTAG)
+    if name == private.SELF_BTAG then return nil end
+    return private.SanitizeName(name, private.MAX_NAME_CHARS)
+end
+
+---@return string? name -- the own name if guildmates get it
+private.GetSharedName = function()
+    local db = private.db
+    if not (db.share and db.shareName) then return nil end
+    return private.GetOwnName()
+end
+
 ---@param set table -- [Name-Realm] = true
 ---@return table list -- sorted names
 private.SortedKeys = function(set)
@@ -147,9 +191,13 @@ end
 ---Hash of what an account shares, used to notice changes without sending the whole list
 ---@param key string
 ---@param chars table -- sorted list
+---@param name string? -- left out of the text if nil, so older versions get the same hash
 ---@return string hash
-private.HashPayload = function(key, chars)
+private.HashPayload = function(key, chars, name)
     local text = key .. "|" .. table.concat(chars, ",")
+    if name then
+        text = text .. "|" .. name
+    end
     local hash = 5381
     for index = 1, #text do
         hash = (hash * 33 + text:byte(index)) % 4294967296

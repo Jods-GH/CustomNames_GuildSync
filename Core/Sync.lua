@@ -59,14 +59,16 @@ local function ReadPayload(sender, message)
     if not display or display == "" then
         display = (strsplit("-", sender))
     end
+    local name = private.SanitizeName(message.name, private.MAX_NAME_CHARS)
     return {
         id = syncId,
         key = key,
         btag = message.btag,
         display = display,
+        name = name,
         sender = sender,
         chars = chars,
-        hash = private.HashPayload(key, chars), -- worked out again, the one that was sent is not trusted
+        hash = private.HashPayload(key, chars, name), -- worked out again, the one that was sent is not trusted
         receivedAt = time(),
     }
 end
@@ -84,9 +86,19 @@ Sync.WantsData = function(syncId, hash)
     return true
 end
 
+---@param key string
+---@return string? customName -- nil if none is set
+local function GetCustomName(key)
+    local customName = lib.Get(key)
+    if customName ~= key then
+        return customName
+    end
+    return nil
+end
+
 ---Works out what accepting a pending entry would change
 ---@param syncId string
----@return table? diff -- { added = list, removed = list, conflicts = list, moved = number, oldKey = string? }
+---@return table? diff -- { added = list, removed = list, conflicts = list, moved = number, oldKey = string?, name = string|false|nil }
 Sync.GetDiff = function(syncId)
     local db = private.db
     local payload = db.pending[syncId]
@@ -98,6 +110,10 @@ Sync.GetDiff = function(syncId)
     local linked = lib.GetLinkedCharacters(payload.key)
     local incoming = {}
     local diff = { added = {}, removed = {}, conflicts = {}, moved = 0, oldKey = oldKey }
+    -- false: the name that was shared before isn't shared anymore
+    if payload.name ~= (account and account.name) then
+        diff.name = payload.name or false
+    end
     for _, charname in ipairs(payload.chars) do
         incoming[charname] = true
         if excluded[charname] then
@@ -123,7 +139,7 @@ end
 ---@param diff table
 ---@return boolean empty -- accepting would change nothing
 local function IsEmpty(diff)
-    return #diff.added == 0 and #diff.removed == 0 and #diff.conflicts == 0 and not diff.oldKey
+    return #diff.added == 0 and #diff.removed == 0 and #diff.conflicts == 0 and not diff.oldKey and diff.name == nil
 end
 
 local function Changed()
@@ -190,6 +206,14 @@ Sync.Accept = function(syncId, trust)
         for _, charname in ipairs(diff.added) do
             lib.AddCharToBtag(charname, account.key)
             account.accepted[charname] = true
+        end
+        if diff.name ~= nil then
+            -- a name the user set themself stays, the shared one is only suggested then
+            local customName = GetCustomName(account.key)
+            if (diff.name or customName) and (not customName or customName == account.name) then
+                lib.Set(account.key, diff.name or nil)
+            end
+            account.name = diff.name or nil
         end
     end)
     -- characters the guildmate doesn't share anymore don't have to be remembered as removed
@@ -272,7 +296,9 @@ Sync.Forget = function(syncId)
             for charname in pairs(account.accepted) do
                 lib.RemoveCharFromBtag(charname, account.key)
             end
-            if account.key:sub(1, #private.ANON_PREFIX) == private.ANON_PREFIX and lib.Get(account.key) ~= account.key then
+            local customName = GetCustomName(account.key)
+            local isAnon = account.key:sub(1, #private.ANON_PREFIX) == private.ANON_PREFIX
+            if customName and (isAnon or customName == account.name) then
                 lib.Set(account.key)
             end
         end)
@@ -301,6 +327,7 @@ Sync.OnData = function(sender, message)
         if account then
             account.lastHash, account.lastSeen, account.sender = payload.hash, payload.receivedAt, sender
             account.display = payload.display
+            account.name = payload.name
         end
         Changed()
         return
@@ -310,7 +337,9 @@ Sync.OnData = function(sender, message)
         private.Print(private.getLocalisation("ChatAutoApplied"):format(payload.display))
         return
     end
-    if account then
+    if account and #diff.added + #diff.removed == 0 and diff.name then
+        private.Print(private.getLocalisation("ChatPendingName"):format(payload.display, diff.name))
+    elseif account then
         private.Print(private.getLocalisation("ChatPendingChange"):format(payload.display, #diff.added, #diff.removed))
     else
         private.Print(private.getLocalisation("ChatPending"):format(payload.display, #payload.chars))
@@ -328,6 +357,17 @@ Sync.FindByKey = function(key)
         end
     end
     return nil
+end
+
+---Uses the name the guildmate shares as the custom name, replacing what the user set
+---@param syncId string
+Sync.UseSharedName = function(syncId)
+    local account = private.db.accounts[syncId]
+    if not account or not account.name then return end
+    Apply(function()
+        lib.Set(account.key, account.name)
+    end)
+    Changed()
 end
 
 ---Removes one accepted character from a guildmate, later shares don't offer it again

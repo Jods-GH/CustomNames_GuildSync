@@ -8,6 +8,7 @@ local Sync = private.Sync
 -- the right side (through the toolkit of lib.GetUIToolkit) and the footer
 local KEY_YOU = "GuildSync:you"
 local KEY_BLOCKED = "GuildSync:blocked:" -- followed by the sync id
+local KEY_NICKNAME = "GuildSync:nsrt:" -- followed by Name-Realm
 local variables = {
     separator = " · ",
 }
@@ -24,12 +25,15 @@ end
 
 ---@param key string? -- custom name key of CustomNames, or one of the keys above
 ---@return string? syncId
----@return string? kind -- "you", "pending", "account" or "blocked"
+---@return string? kind -- "you", "pending", "account", "nickname" or "blocked"
 local function ResolveKey(key)
     if not key then return nil end
     if key == KEY_YOU then return nil, "you" end
     if key:sub(1, #KEY_BLOCKED) == KEY_BLOCKED then
         return key:sub(#KEY_BLOCKED + 1), "blocked"
+    end
+    if key:sub(1, #KEY_NICKNAME) == KEY_NICKNAME then
+        return key:sub(#KEY_NICKNAME + 1), "nickname"
     end
     local db = private.db
     for syncId, payload in pairs(db.pending) do
@@ -87,7 +91,11 @@ local function GetSharingText()
         return private.getLocalisation("SharingOff")
     end
     local _, battleTag = private.GetOwnKey()
-    return private.getLocalisation(battleTag and "SharingBattleTag" or "SharingAnonymous")
+    local text = private.getLocalisation(battleTag and "SharingBattleTag" or "SharingAnonymous")
+    if private.GetSharedName() then
+        text = private.getLocalisation("SharingWithName"):format(text)
+    end
+    return text
 end
 
 local provider = {}
@@ -143,6 +151,30 @@ provider.GetItems = function(search)
                     value = customName or private.getLocalisation("NotSet"),
                     valueColor = not customName and Theme.colors.disabled or nil,
                 })
+            end
+        end
+    end
+    local charNames = lib.GetCharList()
+    for charname, entry in pairs(db.nicknames) do
+        if not private.NSRT.IsBlocked(charname) and (entry.offer ~= nil or entry.nickname) then
+            local customName = charNames[charname]
+            local isPending = entry.offer ~= nil
+            if isPending then
+                pendingCount = pendingCount + 1
+            else
+                accountCount = accountCount + 1
+            end
+            if MatchesSearch(search, charname, entry.nickname, entry.offer or nil, customName) then
+                local item = { key = KEY_NICKNAME .. charname, title = (strsplit("-", charname)), subtitle = charname }
+                if isPending then
+                    item.value = private.getLocalisation(entry.nickname and "NicknameChanged" or "NewAccount")
+                    item.valueColor = Theme.colors.accent
+                    table.insert(pendingItems, item)
+                else
+                    item.value = customName or private.getLocalisation("NotSet")
+                    item.valueColor = not customName and Theme.colors.disabled or nil
+                    table.insert(accountItems, item)
+                end
             end
         end
     end
@@ -216,6 +248,17 @@ local function ShowYou(ui)
         ui.Add(ui.CreateLabel(private.getLocalisation("NoBattleTag"), "small", Theme.colors.muted), margins.noticeMargin)
     end
 
+    ui.Add(ui.CreateToggle(private.getLocalisation("ShareNameToggle"), db.shareName, function(value)
+        db.shareName = value
+        private.Comm.BroadcastHello()
+        ui.Refresh(true)
+    end), margins.noticeMargin)
+    if db.shareName then
+        local ownName = private.GetOwnName()
+        local hint = ownName and private.getLocalisation("ShareNameHint"):format(ownName) or private.getLocalisation("NoOwnName")
+        ui.Add(ui.CreateLabel(hint, "small", Theme.colors.muted), margins.noticeMargin)
+    end
+
     ui.Add(ui.CreateCaption(private.getLocalisation("SharedCharacters")), margins.sectionMargin)
     ui.AddCharacterGrid(private.GetOwnChars())
     ui.Finish()
@@ -284,6 +327,18 @@ local function ShowAccount(ui, key, syncId, isPending)
             notice = ui.CreateLabel(private.getLocalisation("EnterToSave"), "small", Theme.colors.disabled)
         end
         ui.Add(notice, margins.noticeMargin)
+        if not isPending and account.name and account.name ~= customName then
+            local line = ui.CreateLine()
+            local suggestion = ui.CreateLabel(private.getLocalisation("SuggestedName"):format(account.name), "small", Theme.colors.muted)
+            suggestion:SetUserData("flex", 1)
+            line:AddChild(suggestion)
+            line:AddChild(ui.CreateButton(private.getLocalisation("UseSuggestedName"), "ghost", function()
+                Sync.UseSharedName(syncId)
+                pendingNotice = { key = key, text = private.getLocalisation("Saved") }
+                ui.Refresh(true)
+            end))
+            ui.Add(line, margins.fieldMargin)
+        end
     end
 
     -- docked to the bottom, has to be added before whatever fills the rest
@@ -323,6 +378,11 @@ local function ShowAccount(ui, key, syncId, isPending)
         if diff.oldKey and diff.moved > 0 then
             ui.Add(ui.CreateLabel(private.getLocalisation("PendingMoved"):format(diff.moved), "small", Theme.colors.text), margins.noticeMargin)
         end
+        if diff.name then
+            ui.Add(ui.CreateLabel(private.getLocalisation("PendingName"):format(diff.name), "small", Theme.colors.text), margins.noticeMargin)
+        elseif diff.name == false then
+            ui.Add(ui.CreateLabel(private.getLocalisation("PendingNameRemoved"), "small", Theme.colors.text), margins.noticeMargin)
+        end
         local groups = {}
         AddDiffGroup(ui, groups, diff.added, "PendingGroupAdded", Theme.colors.success)
         AddDiffGroup(ui, groups, diff.removed, "PendingGroupRemoved", Theme.colors.danger)
@@ -344,6 +404,82 @@ local function ShowAccount(ui, key, syncId, isPending)
                 ui.Refresh(true)
             end)
         end
+    end
+    ui.Finish()
+end
+
+---@param ui table
+---@param charname string
+local function ShowNickname(ui, charname)
+    local NSRT = private.NSRT
+    local Theme, margins = ui.Theme, ui.margins
+    local entry = private.db.nicknames[charname]
+    if not entry then
+        provider.ShowEmpty(ui)
+        return
+    end
+    local customName = lib.GetCharList()[charname]
+
+    ui.Begin("guild:nsrt:" .. charname)
+    ui.AddHeader((ui.SplitCharName(charname)), private.getLocalisation("KindNickname"))
+    ui.Add(ui.CreateLabel(private.getLocalisation("SharedBy"):format(charname), "small", Theme.colors.muted), margins.noticeMargin)
+
+    local bottomLine = ui.CreateLine()
+    bottomLine:AddChild(ui.CreateSpacer())
+    bottomLine:AddChild(ui.CreateButton(private.getLocalisation("Block"), "danger", function()
+        NSRT.Block(charname)
+        ui.Refresh(true)
+    end))
+    if entry.nickname then
+        bottomLine:AddChild(ui.CreateButton(private.getLocalisation("Forget"), "danger", function()
+            NSRT.Forget(charname)
+            ui.Refresh(true)
+        end))
+    end
+    ui.Add(bottomLine, 0, "BOTTOM")
+
+    if entry.offer ~= nil then
+        local line = ui.CreateLine()
+        line:AddChild(ui.CreateButton(private.getLocalisation("Accept"), "primary", function()
+            NSRT.Accept(charname)
+            ui.Refresh(true)
+        end))
+        line:AddChild(ui.CreateButton(private.getLocalisation("AcceptTrust"), "ghost", function()
+            NSRT.Accept(charname, true)
+            ui.Refresh(true)
+        end))
+        line:AddChild(ui.CreateButton(private.getLocalisation("Decline"), "ghost", function()
+            NSRT.Decline(charname)
+            ui.Refresh(true)
+        end))
+        ui.Add(line, margins.groupMargin, "BOTTOM")
+
+        ui.Add(ui.CreateCaption(private.getLocalisation("PendingTitle")), margins.sectionMargin)
+        if entry.offer then
+            ui.Add(ui.CreateLabel(private.getLocalisation("PendingName"):format(entry.offer), "small", Theme.colors.text), margins.noticeMargin)
+        else
+            ui.Add(ui.CreateLabel(private.getLocalisation("NicknameRemoved"), "small", Theme.colors.text), margins.noticeMargin)
+        end
+        if customName and customName ~= entry.nickname then
+            ui.Add(ui.CreateLabel(private.getLocalisation("NicknameKept"):format(customName), "small", Theme.colors.muted), margins.noticeMargin)
+        end
+    else
+        ui.Add(ui.CreateLabel(private.getLocalisation("NicknameLabel") .. ": " .. (customName or private.getLocalisation("NotSet")), "body", Theme.colors.text), margins.fieldMargin)
+        if entry.nickname and entry.nickname ~= customName then
+            local line = ui.CreateLine()
+            local suggestion = ui.CreateLabel(private.getLocalisation("SuggestedName"):format(entry.nickname), "small", Theme.colors.muted)
+            suggestion:SetUserData("flex", 1)
+            line:AddChild(suggestion)
+            line:AddChild(ui.CreateButton(private.getLocalisation("UseSuggestedName"), "ghost", function()
+                NSRT.UseNickname(charname)
+                ui.Refresh(true)
+            end))
+            ui.Add(line, margins.fieldMargin)
+        end
+        ui.Add(ui.CreateToggle(private.getLocalisation("TrustToggle"), entry.trusted, function(value)
+            NSRT.SetTrusted(charname, value)
+            ui.Refresh(true)
+        end), margins.sectionMargin)
     end
     ui.Finish()
 end
@@ -373,6 +509,8 @@ provider.ShowDetail = function(key, ui)
         ShowYou(ui)
     elseif kind == "blocked" then
         ShowBlocked(ui, syncId)
+    elseif kind == "nickname" then
+        ShowNickname(ui, syncId)
     elseif syncId then
         ShowAccount(ui, key, syncId, kind == "pending")
     else
@@ -414,6 +552,11 @@ provider.GetBadge = function()
     local count = 0
     for _ in pairs(private.db.pending) do
         count = count + 1
+    end
+    for charname, entry in pairs(private.db.nicknames) do
+        if entry.offer ~= nil and not private.NSRT.IsBlocked(charname) then
+            count = count + 1
+        end
     end
     return count
 end
